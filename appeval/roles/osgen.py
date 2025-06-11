@@ -9,6 +9,7 @@ import copy
 import json
 import random
 import re
+import os
 import shutil
 import sys
 import time
@@ -35,6 +36,7 @@ from appeval.tools.icon_detect import IconDetectTool
 from appeval.tools.ocr import OCRTool
 from tqdm import tqdm
 from pywinauto import Desktop
+from appeval.utils.window_utils import start_windows
         
 
 # 忽略所有警告
@@ -95,8 +97,9 @@ class OSAgentContext(RoleContext):
         self.screenshot_origin_file = ""
         self.screenshot_draw_file = ""
         self.init_action_list = [
-            "Run (pyautogui.press('win'); time.sleep(1));",
-            "Run (pyperclip.copy(\"\"\"firefox\"\"\"); time.sleep(0.5); pyautogui.hotkey('ctrl', 'v'); time.sleep(1); pyautogui.press('enter'); time.sleep(2))",
+            # "Run (pyautogui.press('win'); time.sleep(1));",
+            # "Run (pyperclip.copy(\"\"\"edge\"\"\"); time.sleep(0.5); pyautogui.hotkey('ctrl', 'v'); time.sleep(1); pyautogui.press('enter'); time.sleep(2))",
+            
         ]
         self.classified_perception_infos = []
         self.next_perception_infos = []
@@ -298,12 +301,13 @@ class OSAgent(Role):
         if self.use_chrome_debugger:
             self.chrome_debugger = ChromeDebugger()
 
-    def _get_timestamped_paths(self) -> None:
+    def _get_timestamped_paths(self, log_dir: Optional[Path | str] = None) -> None:
         """Update file paths with timestamps"""
         current_time = time.strftime("%Y%m%d%H%M")
 
         # Base paths
-        log_dir = Path(self.log_dirs) / current_time
+        if log_dir is None:
+            log_dir = Path(self.log_dirs) / current_time
         self.save_info = str(log_dir / "info.txt")
         self.save_img = log_dir / "images"
         self.save_img.mkdir(parents=True, exist_ok=True)
@@ -881,7 +885,6 @@ Return the filtered infos in the following format without any other text:
         hash_last = self.calculate_dhash(last_screenshot)
         hash_now = self.calculate_dhash(now_screenshot)
         screenshot_similarity = self.compare_hashes_similarity(hash_last, hash_now)
-        breakpoint()
         
         # perception infos similarity
         last_perception_infos = last["perception_infos"]
@@ -896,7 +899,7 @@ Return the filtered infos in the following format without any other text:
             return True
         return False
     
-    async def _classify_perception_infos(self, perception_infos: List[Dict]) -> Dict[str, List[Dict]]:
+    async def _classify_perception_infos(self, perception_infos: List[Dict], max_classification_num: int=5) -> Dict[str, List[Dict]]:
         """Classify perception infos into different categories"""
         # Call LLM to generate decision
         images = [encode_image(self.screenshot_file)]
@@ -912,10 +915,12 @@ Return the filtered infos in the following format without any other text:
         info_prompt = r'{"coordinates": (x, y)}' if rm_description_prompt else r'{"coordinates": (x, y), "description": "text content"}'
 
         classify_prompt = f"""
-Please classify the following perception infos into different categories:
+Please fliter out and classify the following perception infos:
 {perception_infos_str}
 
-You can filter out some infos that are window control info and navigation bar control info, but other infos should be all classified, don't miss any infos!
+Note that:
+1. Filter out the infos that are not clickable or clicking will not cause significant changes.
+2. Classify the remaining infos into different categories based on their functional purpose.
 
 Return the classification result in the following format without any other text:
 [
@@ -923,30 +928,44 @@ Return the classification result in the following format without any other text:
     ...
 ]
 """
-        output = await self.llm.aask(
-                classify_prompt,
-                system_msgs=[system_msg],
-                images=images,
-                stream=False,
-            )
+        while True:
+            try:
+                output = await self.llm.aask(
+                        classify_prompt,
+                        system_msgs=[system_msg],
+                        images=images,
+                        stream=False,
+                    )
 
-        categories = re.findall(r'"category": "(.*?)",', output)
-        classification_result = [
-            {"category": category, "infos": []}
-            for category in categories
-        ]
-        infos = output.split("infos")
-        idx = 0
-        for info in infos:
-            if "coordinates" in info:
-                coordinates = re.findall(r'"coordinates": \((.*?), (.*?)\)', info)
-                if rm_description_prompt:
-                    descriptions = [""] * len(coordinates)
-                else:
-                    descriptions = re.findall(r'"description": "(.*?)"', info)
-                classification_result[idx]["infos"] = [{"coordinates": (x, y), "text": description} for description, (x, y) in zip(descriptions, coordinates)]
-                idx += 1
-        logger.info(f"Filtered infos {sum([len(info['infos']) for info in classification_result])} / {len(perception_infos_unique)}")
+                categories = re.findall(r'"category": "(.*?)",', output)
+                classification_result = [
+                    {"category": category, "infos": []}
+                    for category in categories
+                ]
+                
+                infos = output.split("infos")
+                idx = 0
+                for info in infos:
+                    if "coordinates" in info:
+                        coordinates = re.findall(r'"coordinates": \((.*?), (.*?)\)', info)
+                        if rm_description_prompt:
+                            descriptions = [""] * len(coordinates)
+                        else:
+                            descriptions = re.findall(r'"description": "(.*?)"', info)
+                        classification_result[idx]["infos"] = [{"coordinates": (x, y), "text": description} for description, (x, y) in zip(descriptions, coordinates)]
+                        idx += 1
+                # filter window, navigation bar, tab, bookmark infos
+                final_classification_result = []
+                for info in classification_result:
+                    if any(i in info["category"].lower() for i in ["window", "navigation", "bookmark", "control", "bar", "tab"]):
+                        continue
+                    if len(info["infos"]) > max_classification_num:
+                        info["infos"] = random.sample(info["infos"], max_classification_num)
+                    final_classification_result.append(info)
+                logger.info(f"Filtered infos {sum([len(info['infos']) for info in classification_result])} / {len(perception_infos_unique)}")
+                break
+            except Exception as e:
+                logger.error(f"Error in classifying perception infos: {e}")
         return classification_result
     
     def visual_classification(self, classified_infos: List[Dict], image_path: str) -> None:
@@ -962,11 +981,11 @@ Return the classification result in the following format without any other text:
                 y = int(item["coordinates"][1])
                 draw.rectangle([x, y, x + 20, y + 20], outline=color, width=2, fill=color)
 
-            draw.text((text_width, text_height), f"{info['category']}", fill=color, stroke_width=2, stroke_fill=color)
+            draw.text((text_width, text_height), f"{info['category']}", fill=color, stroke_width=1)
             text_height += 20
         image.save(image_path.replace(".jpg", f"_classified_{time.strftime('%Y%m%d_%H%M%S')}.jpg"))
 
-    async def _dfs(self, name="", max_depth=5, max_width=3) -> None:
+    async def _dfs(self, name="", max_depth=10, max_width=5) -> None:
         """Depth-first search (DFS) for exploring clickable elements on the screen.
         Args:
             name (str): Name of the current DFS iteration.
@@ -1033,8 +1052,11 @@ Return the classification result in the following format without any other text:
     def _maximize_window(self) -> None:
         windows = Desktop(backend="uia").windows()
         for w in windows:
+            if "Chrome" in w.window_text() or "Firefox" in w.window_text() or "Edge" in w.window_text():
+                w.maximize()
+            else:
+                continue
             try:
-                # 检查窗口是否可见且支持最大化
                 if w.is_visible() and hasattr(w, 'maximize'):
                     # 过滤掉系统窗口和特殊窗口
                     window_text = w.window_text() if hasattr(w, 'window_text') else ""
@@ -1065,15 +1087,27 @@ Return the classification result in the following format without any other text:
         windows = Desktop(backend="uia").windows()
         for w in windows:
             try:
-                w.close()
+                # edge, google chrome, firefox, etc.
+                if "Chrome" in w.window_text() or "Firefox" in w.window_text() or "Edge" in w.window_text():
+                    w.close()
+                else:
+                    w.minimize()
             except Exception as e:
                 logger.warning(f"Failed to close window {w}: {e}")
         time.sleep(1)
-        for action in self.rc.init_action_list:
-            self.rc.action = action
-            logger.info(f"Initial action: {self.rc.action}")
-            await self._act()
-        
+        await start_windows(
+            target_url="https://www.baidu.com/",
+            app_path="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+        )
+        # full screen
+        time.sleep(1)
+        self.rc.action = "Run (pyautogui.press('f11'); time.sleep(1));"
+        await self._act()
+        # for action in self.rc.init_action_list:
+        #     self.rc.action = action
+        #     logger.info(f"Initial action: {self.rc.action}")
+        #     await self._act()
+
         self._maximize_window()
    
         for action in self.rc.action_history:
@@ -1082,7 +1116,7 @@ Return the classification result in the following format without any other text:
             await self._act()
         logger.info(f"Replay finished, last action: {self.rc.action}")
 
-    async def _react(self) -> Message:
+    async def _react(self, max_depth: int = 5, max_width: int = 2) -> Message:
         await self._replay()
         rsp = AIMessage(content="No actions taken yet", cause_by=Action)  # will be overwritten after Role _act
         (
@@ -1091,8 +1125,10 @@ Return the classification result in the following format without any other text:
             self.height,
             self.output_image_path,
         ) = await self._get_perception_infos(self.screenshot_file, self.screenshot_som_file)
-
-        await self._dfs(name="0")
+        start_time = time.time()
+        await self._dfs(name="0", max_depth=max_depth, max_width=max_width)
+        end_time = time.time()
+        logger.info(f"DFS finished in {time.strftime('%H:%M:%S', time.gmtime(end_time - start_time))} seconds, max_depth: {max_depth}, max_width: {max_width}")
         
         if self.use_chrome_debugger:
             self.chrome_debugger.stop_monitoring()
@@ -1128,6 +1164,8 @@ Return the classification result in the following format without any other text:
         gen_dir = file_dir.parent / "gen"
         gen_dir.mkdir(parents=True, exist_ok=True)
         file_name = path.stem
+        if (gen_dir / f"{file_name}.json").exists():
+            return
         file_name_list = [f"{file_name[:i + 1]}" for i in range(0, len(file_name), 2)]
         file_path_list = [file_dir / f"{file_name}.json" for file_name in file_name_list]
         
@@ -1224,13 +1262,16 @@ a clear and general task instruction
         # breakpoint()
         
         system_msg = "You are a helpful AI assistant for generating task instructions and step-by-step task list, thinking process and operations for each action taken to complete user tasks. You excel at analyzing screenshots and user interactions to create detailed, structured training data for AI agents."
-        
-        output = await self.llm.aask(
-            gen_prompt,
-            system_msgs=[system_msg],
-            images=images,
-            stream=False,
-        )
+        try:
+            output = await self.llm.aask(
+                gen_prompt,
+                system_msgs=[system_msg],
+                images=images,
+                stream=False,
+            )
+        except Exception as e:
+            logger.error(f"Error generating task instruction and step-by-step task list: {e}")
+            return
         
         # with open("output.txt", "w", encoding="utf-8") as f:
         #     f.write(output)
@@ -1337,12 +1378,8 @@ Please output the task list in the following format:
         initial_task_list = gen_instruction_list[0]["init_tasklist"]
         last_task_list = initial_task_list
 
-        initial_task_data = {
-            "message": self._conv_format(system_msg, [initial_task_prompt], [initial_task_list]),
-            "images": [screenshot_origin_file_list[0]]
-        }
         with open(prompt_dir / f"{file_name}_init_tasklist.jsonl", "w", encoding="utf-8") as f:
-            f.write(json.dumps(initial_task_data, ensure_ascii=False) + "\n")
+            f.write(json.dumps(self._conv_format(system_msg, [initial_task_prompt], [initial_task_list], [screenshot_origin_file_list[0]]), ensure_ascii=False) + "\n")
         
         user_msg = []
         user_msg_perception = []
@@ -1375,13 +1412,16 @@ Please output the task list in the following format:
             thought_history = thought_history[:-1]
             summary_history = summary_history[:-1]
             action_history = action_history[:-1]
+
+            # open screenshot_origin_file_list[i - 1] to get width and height
+            width, height = Image.open(screenshot_origin_file_list[i - 1]).size
              
             # Generate action
             ctx = ActionPromptContext(
                 instruction=instruction,
                 clickable_infos=last_perception_infos,
-                width=1920,
-                height=1080,
+                width=width,
+                height=height,
                 thought_history=thought_history,
                 summary_history=summary_history,
                 action_history=action_history,
@@ -1416,12 +1456,36 @@ Please output the task list in the following format:
             for u, a, i in zip(user_msg, assistant_msg, images):
                 f.write(json.dumps(self._conv_format(system_msg, [u], [a], [i]), ensure_ascii=False) + "\n")
 
-        with open(prompt_dir / f"{file_name}_all_perception.jsonl", "w", encoding="utf-8") as f:
-            f.write(json.dumps(self._conv_format(system_msg, user_msg_perception, assistant_msg, images), ensure_ascii=False))
+        # with open(prompt_dir / f"{file_name}_multistep_perception.jsonl", "w", encoding="utf-8") as f:
+        #     f.write(json.dumps(self._conv_format(system_msg, user_msg_perception, assistant_msg, images), ensure_ascii=False))
         
-        with open(prompt_dir / f"{file_name}_all.jsonl", "w", encoding="utf-8") as f:
-            f.write(json.dumps(self._conv_format(system_msg, user_msg, assistant_msg, images), ensure_ascii=False))
+        # with open(prompt_dir / f"{file_name}_multistep.jsonl", "w", encoding="utf-8") as f:
+        #     f.write(json.dumps(self._conv_format(system_msg, user_msg, assistant_msg, images), ensure_ascii=False))
+    
+    async def _gather_prompt(self, file_dir: Path) -> None:
+        target_dir = file_dir.parent
+    
+        target_file_list = [
+            target_dir / "init_tasklist.jsonl",
+            target_dir / "onestep_perception.jsonl",
+            target_dir / "onestep.jsonl",
+            # target_dir / "multistep_perception.jsonl",
+            # target_dir / "multistep.jsonl",
+        ]
+        pattern_list = [
+            "*_init_tasklist.jsonl",
+            "*_onestep_perception.jsonl",
+            "*_onestep.jsonl",
+            # "*_multistep_perception.jsonl",
+            # "*_multistep.jsonl",
+        ]
         
+        for pattern, target_file in zip(pattern_list, target_file_list):
+            file_list = [file for file in file_dir.glob(pattern)]
+            with open(target_file, "w", encoding="utf-8") as f:
+                for file in file_list:
+                    with open(file, "r", encoding="utf-8") as f_in:
+                        f.write(f_in.read().strip() + "\n")
 
     async def run(self, instruction: str) -> Message:
         """Run main loop.
@@ -1436,18 +1500,28 @@ Please output the task list in the following format:
         # await self.full_replay("workspace/202505282027/state/0_1_0_0_1.json")
         # await self.full_replay("workspace/202505301539/state/0_0_0_0_0_0_0.json")
         
-        rsp = await self._react()
-        
-        file_dir = Path("workspace/202506040936/state")
-        # max length filename
+        # rsp = await self._react(max_depth=5, max_width=2)
+        file_dir = Path(r"workspace\202506111549\state")
+        # # max length filename
         max_filename_length = max([len(file.stem) for file in file_dir.glob("*.json")])
         file_path_list = [file for file in file_dir.glob("*.json") if len(file.stem) == max_filename_length]
-        # breakpoint()
-        # for file_path in file_path_list:
+        # # breakpoint()
+        # start_time = time.time()
+        # for file_path in tqdm(file_path_list):
         #     rsp = await self._back_generate(file_path)
-
-        for file_path in file_path_list:
-            rsp = await self._gen_action_prompt(file_path)
+        # end_time = time.time()
+        # logger.info(f"Back generate finished in {time.strftime('%H:%M:%S', time.gmtime(end_time - start_time))} seconds, {len(file_path_list)} files")
+        
+        start_time = time.time()
+        # for file_path in file_path_list:
+        #     try:
+        #         rsp = await self._gen_action_prompt(file_path)
+        #     except Exception as e:
+        #         logger.error(f"Error in gen_action_prompt: {e}, pass {file_path}")
+        #         continue
+        await self._gather_prompt(file_dir.parent / "prompt")
+        end_time = time.time()
+        logger.info(f"Gen action prompt finished in {time.strftime('%H:%M:%S', time.gmtime(end_time - start_time))} seconds, {len(file_path_list)} files")
         
         return ""
     
