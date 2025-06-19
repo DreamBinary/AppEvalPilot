@@ -319,10 +319,6 @@ class OSAgent(Role):
         self.last_screenshot_file = str(self.screenshot_dir / "last_screenshot.jpg")
         self.last_screenshot_som_file = str(self.screenshot_dir / "last_screenshot_som.png")
         
-        # Trace dir
-        self.trace_dir = log_dir / "trace"
-        self.trace_dir.mkdir(parents=True, exist_ok=True)
-        
         self.state_dir = log_dir / "state"
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1096,7 +1092,7 @@ Return the classification result in the following format without any other text:
                 logger.warning(f"Failed to close window {w}: {e}")
         time.sleep(1)
         await start_windows(
-            target_url="https://www.baidu.com/",
+            target_url=os.getenv("TARGET_URL"),
             app_path="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
         )
         # full screen
@@ -1479,13 +1475,18 @@ Please output the task list in the following format:
             # "*_multistep_perception.jsonl",
             # "*_multistep.jsonl",
         ]
-        
+        cnt_dict = {}
         for pattern, target_file in zip(pattern_list, target_file_list):
             file_list = [file for file in file_dir.glob(pattern)]
+            cnt = 0
             with open(target_file, "w", encoding="utf-8") as f:
                 for file in file_list:
                     with open(file, "r", encoding="utf-8") as f_in:
+                        cnt += 1
                         f.write(f_in.read().strip() + "\n")
+            logger.info(f"Target file {target_file} has {cnt} files on URL {os.getenv('TARGET_URL')}")
+            cnt_dict[target_file.stem] = cnt
+        return cnt_dict
 
     async def run(self, instruction: str) -> Message:
         """Run main loop.
@@ -1496,33 +1497,35 @@ Please output the task list in the following format:
         self._reset_state()  # Reset state for each run
         self._setup_logs()  # Reset logs for each run
         self.instruction = instruction
-        
-        # await self.full_replay("workspace/202505282027/state/0_1_0_0_1.json")
-        # await self.full_replay("workspace/202505301539/state/0_0_0_0_0_0_0.json")
-        
-        # rsp = await self._react(max_depth=5, max_width=2)
-        file_dir = Path(r"workspace\202506111549\state")
+        max_depth = 8
+        max_width = 8
+        await self._react(max_depth=max_depth, max_width=max_width)
+        file_dir = Path(self.state_dir)
         # # max length filename
         max_filename_length = max([len(file.stem) for file in file_dir.glob("*.json")])
         file_path_list = [file for file in file_dir.glob("*.json") if len(file.stem) == max_filename_length]
         # # breakpoint()
-        # start_time = time.time()
-        # for file_path in tqdm(file_path_list):
-        #     rsp = await self._back_generate(file_path)
-        # end_time = time.time()
-        # logger.info(f"Back generate finished in {time.strftime('%H:%M:%S', time.gmtime(end_time - start_time))} seconds, {len(file_path_list)} files")
+        start_time = time.time()
+        for file_path in tqdm(file_path_list):
+            rsp = await self._back_generate(file_path)
+        end_time = time.time()
+        logger.info(f"Back generate finished in {time.strftime('%H:%M:%S', time.gmtime(end_time - start_time))} seconds, {len(file_path_list)} files")
         
         start_time = time.time()
-        # for file_path in file_path_list:
-        #     try:
-        #         rsp = await self._gen_action_prompt(file_path)
-        #     except Exception as e:
-        #         logger.error(f"Error in gen_action_prompt: {e}, pass {file_path}")
-        #         continue
-        await self._gather_prompt(file_dir.parent / "prompt")
+        for file_path in file_path_list:
+            try:
+                rsp = await self._gen_action_prompt(file_path)
+            except Exception as e:
+                logger.error(f"Error in gen_action_prompt: {e}, pass {file_path}")
+                continue
+        cnt_dict = await self._gather_prompt(file_dir.parent / "prompt")
         end_time = time.time()
         logger.info(f"Gen action prompt finished in {time.strftime('%H:%M:%S', time.gmtime(end_time - start_time))} seconds, {len(file_path_list)} files")
-        
+
+        gen_info = {"dir": str(file_dir.parent.stem), "url": os.getenv("TARGET_URL"), "max_depth": max_depth, "max_width": max_width}
+        gen_info.update(cnt_dict)
+        with open(file_dir.parent.parent / "gen.txt", "a", encoding="utf-8") as f:
+            f.write(json.dumps(gen_info, ensure_ascii=False) + "\n")
         return ""
     
     async def full_replay(self, filepath: str) -> None:
