@@ -905,6 +905,13 @@ Return the filtered infos in the following format without any other text:
         system_msg = f"You are an expert UI element classification assistant for {'mobile phone' if self.platform=='Android' else 'PC'} interfaces. Your task is to analyze and categorize UI elements from screenshots based on their visual appearance, text content, and functional purpose. You should group similar elements together and provide meaningful category names that reflect their functionality or type (e.g., 'Navigation Buttons', 'Text Fields', 'Menu Items', 'Content Areas', 'Action Buttons', 'Status Indicators', etc.). Focus on creating logical groupings that would be useful for automated interaction."
 
         perception_infos_unique = self._deduplicate_by_coordinates(perception_infos)
+
+        # filter out some infos
+        filter_texts = ["登录", "login", "注册", "download", "下载", "引导"]
+        perception_infos_unique = [
+            info for info in perception_infos_unique
+            if not any(text in info["text"].lower() for text in filter_texts)
+        ]
         
         perception_infos_str = "\n".join([f"{i+1}. {{coordinates: {info['coordinates']}, description: {{{info['text']}}}}}" for i, info in enumerate(perception_infos_unique)])
         rm_description_prompt = False
@@ -915,7 +922,7 @@ Please fliter out and classify the following perception infos:
 {perception_infos_str}
 
 Note that:
-1. Filter out the infos that are not clickable or clicking will not cause significant changes.
+1. Filter out the following infos: (1) are not clickable (2) clicking will not cause significant changes (3) clicking will generate pop-up Windows (4) are functional buttons or links that donot contain information.
 2. Classify the remaining infos into different categories based on their functional purpose.
 
 Return the classification result in the following format without any other text:
@@ -951,18 +958,22 @@ Return the classification result in the following format without any other text:
                         classification_result[idx]["infos"] = [{"coordinates": (x, y), "text": description} for description, (x, y) in zip(descriptions, coordinates)]
                         idx += 1
                 # filter window, navigation bar, tab, bookmark infos
-                final_classification_result = []
-                for info in classification_result:
-                    if any(i in info["category"].lower() for i in ["window", "navigation", "bookmark", "control", "bar", "tab"]):
-                        continue
-                    if len(info["infos"]) > max_classification_num:
-                        info["infos"] = random.sample(info["infos"], max_classification_num)
-                    final_classification_result.append(info)
+                # final_classification_result = []
+                # for info in classification_result:
+                #     if any(i in info["category"].lower() for i in ["window", "navigation", "bookmark", "control", "bar", "tab"]):
+                #         continue
+                #     if len(info["infos"]) > max_classification_num:
+                #         info["infos"] = random.sample(info["infos"], max_classification_num)
+                #     final_classification_result.append(info)
                 logger.info(f"Filtered infos {sum([len(info['infos']) for info in classification_result])} / {len(perception_infos_unique)}")
                 break
             except Exception as e:
+                e = str(e)
                 logger.error(f"Error in classifying perception infos: {e}")
+                if "quota" in e:
+                    exit()
         return classification_result
+    
     
     def visual_classification(self, classified_infos: List[Dict], image_path: str) -> None:
         image = Image.open(image_path)
@@ -1005,7 +1016,8 @@ Return the classification result in the following format without any other text:
             "screenshot_file": self.rc.screenshot_origin_file,
         }
 
-        if len(self.rc.classified_perception_infos) == 0 or self._update_classified_perception_infos(last_iter_info, current_iter_info):
+        # if len(self.rc.classified_perception_infos) == 0 or self._update_classified_perception_infos(last_iter_info, current_iter_info):
+        if True:
             self.rc.classified_perception_infos = await self._classify_perception_infos(self.rc.perception_infos)
             self.visual_classification(self.rc.classified_perception_infos, self.screenshot_file)
 
@@ -1097,7 +1109,7 @@ Return the classification result in the following format without any other text:
         )
         # full screen
         time.sleep(1)
-        self.rc.action = "Run (pyautogui.press('f11'); time.sleep(1));"
+        # self.rc.action = "Run (pyautogui.press('f11'); time.sleep(1));"
         await self._act()
         # for action in self.rc.init_action_list:
         #     self.rc.action = action
@@ -1258,58 +1270,60 @@ a clear and general task instruction
         # breakpoint()
         
         system_msg = "You are a helpful AI assistant for generating task instructions and step-by-step task list, thinking process and operations for each action taken to complete user tasks. You excel at analyzing screenshots and user interactions to create detailed, structured training data for AI agents."
-        try:
-            output = await self.llm.aask(
-                gen_prompt,
-                system_msgs=[system_msg],
-                images=images,
-                stream=False,
-            )
-        except Exception as e:
-            logger.error(f"Error generating task instruction and step-by-step task list: {e}")
-            return
-        
-        # with open("output.txt", "w", encoding="utf-8") as f:
-        #     f.write(output)
-        # breakpoint()
+        while True:
+            try:
+                output = await self.llm.aask(
+                    gen_prompt,
+                    system_msgs=[system_msg],
+                    images=images,
+                    stream=False,
+                )
+                # with open("output.txt", "w", encoding="utf-8") as f:
+                #     f.write(output)
+                # breakpoint()
 
-        task_instruction = re.findall(r"### Task Instruction ###(.*?)###", output, re.DOTALL)
-        task_instruction = task_instruction[0].strip() if task_instruction else ""
-        
-        # Extract task list
-        init_task_list = re.findall(r"### Initial Task List ###\s*(.*?)\s*###", output, re.DOTALL)
-        init_task_list = init_task_list[0].strip() if init_task_list else ""
-        
-        # Extract step instructions
-        steps_section = re.findall(r"### Step-by-Step Execution Process ###\s*(.*?)\s*### End ###", output, re.DOTALL)
-        steps_content = steps_section[0] if steps_section else ""
-        step_pattern = r"Step (\d+):\s*<think>(.*?)</think>\s*<summary>(.*?)</summary>\s*<tasklist>(.*?)</tasklist>"
-        step_matches = re.findall(step_pattern, steps_content, re.DOTALL)
-    
-        step_instructions = []
-        for step_num, think_content, operation_content, tasklist_content in step_matches:
-            step_instructions.append({
-                "step": step_num,
-                "tasklist": tasklist_content.strip(),
-                "think": think_content.strip(),
-                "operation": operation_content.strip()
-            })
+                task_instruction = re.findall(r"### Task Instruction ###(.*?)###", output, re.DOTALL)
+                task_instruction = task_instruction[0].strip() if task_instruction else ""
+                
+                # Extract task list
+                init_task_list = re.findall(r"### Initial Task List ###\s*(.*?)\s*###", output, re.DOTALL)
+                init_task_list = init_task_list[0].strip() if init_task_list else ""
+                
+                # Extract step instructions
+                steps_section = re.findall(r"### Step-by-Step Execution Process ###\s*(.*?)\s*### End ###", output, re.DOTALL)
+                steps_content = steps_section[0] if steps_section else ""
+                step_pattern = r"Step (\d+):\s*<think>(.*?)</think>\s*<summary>(.*?)</summary>\s*<tasklist>(.*?)</tasklist>"
+                step_matches = re.findall(step_pattern, steps_content, re.DOTALL)
+            
+                step_instructions = []
+                for step_num, think_content, operation_content, tasklist_content in step_matches:
+                    step_instructions.append({
+                        "step": step_num,
+                        "tasklist": tasklist_content.strip(),
+                        "think": think_content.strip(),
+                        "operation": operation_content.strip()
+                    })
 
-        for i in range(len(state_list)):
-            output_path = gen_dir / f"{file_name_list[i]}.json"
-            if output_path.exists():
-                state = json.load(output_path.open("r", encoding="utf-8"))
-            else:
-                state = state_list[i]
-            if "gen_instruction" not in state:
-                state["gen_instruction"] = {}
-            state["gen_instruction"][file_name_list[-1]] = {
-                "task_instruction": task_instruction,
-                "init_tasklist": init_task_list,
-                "step_instructions": step_instructions
-            }
-            with open(gen_dir / f"{file_name_list[i]}.json", "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=4)
+                for i in range(len(state_list)):
+                    output_path = gen_dir / f"{file_name_list[i]}.json"
+                    if output_path.exists():
+                        state = json.load(output_path.open("r", encoding="utf-8"))
+                    else:
+                        state = state_list[i]
+                    if "gen_instruction" not in state:
+                        state["gen_instruction"] = {}
+                    state["gen_instruction"][file_name_list[-1]] = {
+                        "task_instruction": task_instruction,
+                        "init_tasklist": init_task_list,
+                        "step_instructions": step_instructions
+                    }
+                    with open(gen_dir / f"{file_name_list[i]}.json", "w", encoding="utf-8") as f:
+                        json.dump(state, f, ensure_ascii=False, indent=4)
+            except Exception as e:
+                e = str(e)
+                logger.error(f"Error generating task instruction and step-by-step task list: {e}")
+                if "quota" in e:
+                    exit()
                 
     def _conv_format(self, sys_msg: str, user_msg: List[str], assistant_msg: List[str], images: List[str]=[]) -> List[Dict]:
         assert len(user_msg) == len(assistant_msg)
@@ -1497,20 +1511,26 @@ Please output the task list in the following format:
         self._reset_state()  # Reset state for each run
         self._setup_logs()  # Reset logs for each run
         self.instruction = instruction
-        max_depth = 8
-        max_width = 8
+        max_depth = 5
+        max_width = 5
         await self._react(max_depth=max_depth, max_width=max_width)
         file_dir = Path(self.state_dir)
-        # # max length filename
         max_filename_length = max([len(file.stem) for file in file_dir.glob("*.json")])
         file_path_list = [file for file in file_dir.glob("*.json") if len(file.stem) == max_filename_length]
         # # breakpoint()
+        
+        # back generate
         start_time = time.time()
+        gen_dir = file_dir.parent / "gen"
+        gen_finished_file_stem_list = [file.stem for file in gen_dir.glob("*.json") if len(file.stem) == max_filename_length]
         for file_path in tqdm(file_path_list):
+            if file_path.stem in gen_finished_file_stem_list:
+                continue
             rsp = await self._back_generate(file_path)
         end_time = time.time()
         logger.info(f"Back generate finished in {time.strftime('%H:%M:%S', time.gmtime(end_time - start_time))} seconds, {len(file_path_list)} files")
         
+        # gen action prompt
         start_time = time.time()
         for file_path in file_path_list:
             try:
@@ -1522,6 +1542,7 @@ Please output the task list in the following format:
         end_time = time.time()
         logger.info(f"Gen action prompt finished in {time.strftime('%H:%M:%S', time.gmtime(end_time - start_time))} seconds, {len(file_path_list)} files")
 
+        # log result
         gen_info = {"dir": str(file_dir.parent.stem), "url": os.getenv("TARGET_URL"), "max_depth": max_depth, "max_width": max_width}
         gen_info.update(cnt_dict)
         with open(file_dir.parent.parent / "gen.txt", "a", encoding="utf-8") as f:

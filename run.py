@@ -3,7 +3,8 @@ import asyncio
 from pathlib import Path
 
 from appeval.roles.osgen import OSAgent
-
+import pyautogui
+pyautogui.FAILSAFE=False
 
 async def run_osagent(args):
     """Run OSAgent with given arguments"""
@@ -108,10 +109,10 @@ def main():
 
 if __name__ == "__main__":
     import os
-    url_list = [
-        "https://www.baidu.com/",
-        "https://www.taobao.com/",
-    ]
+
+    with open("url.txt", "r") as f:
+        url_list = f.readlines()
+
     for url in url_list:
         os.environ["TARGET_URL"] = url
         main()

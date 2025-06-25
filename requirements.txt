@@ -113,7 +113,6 @@ matplotlib-inline==0.1.7
 mccabe==0.7.0
 mdurl==0.1.2
 meilisearch==0.21.0
-metagpt @ git+https://github.com/geekan/MetaGPT.git@ba2868974b2ecc3fe4218ad29dd334867c07f678
 more-itertools==10.7.0
 motor==3.7.1
 mouseinfo==0.1.3
